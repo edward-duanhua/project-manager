@@ -1,0 +1,10 @@
+{
+  "members": [
+    {
+      "id": "edward-duanhua",
+      "role": "PM",
+      "skills": ["manage", "review", "python", "api", "react", "ui"],
+      "status": "active"
+    }
+  ]
+}
