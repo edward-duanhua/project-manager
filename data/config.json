@@ -4,7 +4,7 @@
     "provider": "google",
     "model": "gemini-3-pro-preview",
     "api_base": "https://generativelanguage.googleapis.com/v1beta/openai",
-    "api_key": "AIzaSyBSkGi6y0FZgMcvz3PUOpVol9qyYGN0FZo",
+    "api_key": "XXXXXX",
     "temperature": 0.7
   },
   "team_config": "skills/project-manager/data/team.json",
