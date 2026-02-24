@@ -1,9 +1,9 @@
-#!/usr/bin/env python3
 import json
 import logging
 import os
-import urllib.request
-import urllib.error
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 class IntelligenceEngine:
     """
@@ -13,6 +13,12 @@ class IntelligenceEngine:
     def __init__(self, logger=None, config_path="skills/project-manager/data/config.json"):
         self.logger = logger or logging.getLogger(__name__)
         self.config = self._load_config(config_path)
+        
+        # Setup session with retry
+        self.session = requests.Session()
+        retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+        self.session.mount('https://', HTTPAdapter(max_retries=retries))
+        self.session.mount('http://', HTTPAdapter(max_retries=retries))
         
         # Domain Knowledge Base (Heuristic Fallback)
         self.domains = {
@@ -77,26 +83,56 @@ class IntelligenceEngine:
     def _call_llm(self, text):
         """
         Calls OpenAI-compatible API to generate tasks.
+        Uses requests with retry logic.
         """
         conf = self.config.get("intelligence", {})
-        # Prioritize direct key in config, fallback to env var
-        api_key = conf.get("api_key") or os.getenv(conf.get("api_key_env", "OPENAI_API_KEY"))
+        
+        # 1. Check api_key_env from config (e.g. "LLM_API_KEY")
+        api_key = None
+        env_var_name = conf.get("api_key_env")
+        if env_var_name:
+            api_key = os.getenv(env_var_name)
+            
+        # 2. Fallback to direct api_key in config
+        if not api_key:
+            api_key = conf.get("api_key")
+
+        # 3. Fallback to standard OpenAI env var
+        if not api_key:
+            api_key = os.getenv("OPENAI_API_KEY")
         
         if not api_key:
-            self.logger.error("LLM Configured but API Key not found in config or environment variables.")
+            self.logger.error("LLM Configured but API Key not found (checked config.api_key_env, config.api_key, and env.OPENAI_API_KEY).")
             return None
 
         prompt = f"""
-        You are a Senior Project Manager.
-        Analyze the following requirement and break it down into 5-10 technical tasks.
-        Return ONLY a JSON array of objects with 'title' and 'labels' keys.
-        Labels should include 'type:design' or 'type:dev' or 'type:test', and domain labels like 'domain:api'.
+        You are a Senior Project Manager and Technical Architect.
+        Analyze the following requirement deeply. Break it down into concrete, actionable technical tasks (5-10 tasks).
         
         Requirement: "{text}"
         
+        Output format: JSON Array of objects.
+        
+        Each object MUST have:
+        - "title": Concise, action-oriented title (e.g., "Design User Schema").
+        - "body": Detailed description including:
+            - **Goal**: What needs to be achieved.
+            - **Technical Considerations**: API endpoints, DB changes, libraries.
+            - **Acceptance Criteria**: Bullet points for DoD (Definition of Done).
+        - "labels": Array of strings.
+            - Must include ONE phase label: 'type:design', 'type:dev', or 'type:test'.
+            - Must include domain labels: 'domain:api', 'domain:ui', 'domain:db', 'domain:security'.
+            - Optional priority: 'p1', 'p2'.
+        - "estimation": Story points (Fibonacci: 1, 2, 3, 5, 8).
+        
         Example JSON Output:
         [
-          {{"title": "Design Database Schema", "labels": ["type:design", "domain:db"]}}
+          {{
+            "title": "Design Database Schema for User Profile",
+            "body": "**Goal**: Create scalable schema for user profiles.\\n**Tech**: PostgreSQL, JSONB for preferences.\\n**DoD**:\\n- [ ] Schema migration script created\\n- [ ] Indexes added for email lookup",
+            "labels": ["type:design", "domain:db", "p1"],
+            "estimation": 3
+          }}
         ]
         """
         
@@ -106,30 +142,40 @@ class IntelligenceEngine:
             "temperature": conf.get("temperature", 0.7)
         }
         
+        url = f"{conf.get('api_base', 'https://api.openai.com/v1')}/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+
         try:
-            req = urllib.request.Request(
-                f"{conf.get('api_base', 'https://api.openai.com/v1')}/chat/completions",
-                data=json.dumps(payload).encode('utf-8'),
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {api_key}"
-                }
-            )
+            response = self.session.post(url, json=payload, headers=headers, timeout=60)
+            response.raise_for_status()
             
-            with urllib.request.urlopen(req) as response:
-                result = json.load(response)
-                content = result['choices'][0]['message']['content']
+            result = response.json()
+            content = result['choices'][0]['message']['content']
+            
+            # Try to parse JSON from content (it might have markdown blocks)
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+            
+            return json.loads(content)
                 
-                # Try to parse JSON from content (it might have markdown blocks)
-                if "```json" in content:
-                    content = content.split("```json")[1].split("```")[0].strip()
-                elif "```" in content:
-                    content = content.split("```")[1].split("```")[0].strip()
-                
-                return json.loads(content)
-                
-        except Exception as e:
+        except requests.exceptions.Timeout:
+            self.logger.error("LLM Call Timeout: The request took too long.")
+            return None
+        except requests.exceptions.RequestException as e:
             self.logger.error(f"LLM Call Failed: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                self.logger.error(f"Response: {e.response.text}")
+            return None
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Failed to parse LLM response as JSON: {e}. Content: {content[:100]}...")
+            return None
+        except Exception as e:
+            self.logger.error(f"Unexpected error in LLM call: {e}")
             return None
 
     def _analyze_heuristic(self, text):

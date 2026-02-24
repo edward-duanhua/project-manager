@@ -8,8 +8,8 @@ class ResourceManager:
     """
     Manages team resources, skill matching, and availability tracking.
     """
-    def __init__(self, config_path="skills/project-manager/data/team.json", logger=None):
-        self.config_path = config_path
+    def __init__(self, config_path=None, logger=None):
+        self.config_path = config_path or "skills/project-manager/data/team.json"
         self.logger = logger or logging.getLogger(__name__)
         self.team = self.load_team()
 

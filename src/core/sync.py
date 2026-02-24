@@ -4,6 +4,7 @@ import logging
 import os
 import datetime
 import subprocess
+import re
 
 class SyncManager:
     """
@@ -26,8 +27,8 @@ class SyncManager:
             self.logger.warning(f"Local file not found: {local_path}. Skipping sync.")
             return
 
-        # 1. Fetch Remote Issues
-        remote_issues = self.connector.fetch_issues(self.repo, state="all")
+        # 1. Fetch Remote Issues (with pagination)
+        remote_issues = self.connector.fetch_issues(self.repo, state="all", limit=500) # Assuming connector handles pagination or increased limit
         if not remote_issues:
             self.logger.warning("No remote issues fetched. Skipping sync.")
             return
@@ -43,24 +44,44 @@ class SyncManager:
         updated_lines = []
         changes_count = 0
 
-        # Regex for Markdown checkbox: - [ ] Title #123
-        import re
-        pattern = re.compile(r'- \[([ x])\] (.*?)(?: #(\d+))?$')
+        # Optimized Regex for Markdown checkbox
+        # Supports:
+        # - [ ] Task Title
+        # - [x] **Task Title**
+        # - [ ] [Task Title](url)
+        # - [ ] Task Title #123
+        pattern = re.compile(r'^\s*- \[([ x])\] (.*?)(?: #(\d+))?\s*$')
 
         for line in lines:
-            match = pattern.search(line.strip())
+            line_stripped = line.strip()
+            # Skip non-task lines quickly
+            if not line_stripped.startswith("- ["):
+                updated_lines.append(line)
+                continue
+
+            match = pattern.search(line_stripped)
             new_line = line
             
             if match:
                 is_checked = match.group(1) == 'x'
-                title = match.group(2).strip()
+                raw_content = match.group(2).strip()
                 issue_id = match.group(3)
+                
+                # Extract clean title by removing Markdown links/bold if needed for matching
+                # But for now, we rely on exact title match if no ID, which might be flaky with formatting.
+                # Better approach: Try to match ID first, then title.
+                
+                # Clean title for matching (remove ** and [])
+                clean_title = re.sub(r'\[(.*?)\]\(.*?\)', r'\1', raw_content) # Remove links
+                clean_title = clean_title.replace('**', '').replace('__', '').strip()
 
                 remote_task = None
                 if issue_id and issue_id in remote_map_id:
                     remote_task = remote_map_id[issue_id]
-                elif title in remote_map_title:
-                    remote_task = remote_map_title[title]
+                elif clean_title in remote_map_title:
+                    remote_task = remote_map_title[clean_title]
+                elif raw_content in remote_map_title: # Try raw content too
+                     remote_task = remote_map_title[raw_content]
 
                 if remote_task:
                     remote_is_closed = remote_task['state'] == 'closed'
@@ -69,6 +90,7 @@ class SyncManager:
                     # Sync Logic
                     if remote_is_closed and not is_checked:
                         # Remote Closed -> Update Local
+                        # Use exact replacement of [ ] with [x] to preserve indentation
                         new_line = line.replace('- [ ]', '- [x]', 1)
                         self.logger.info(f"Sync: Remote #{remote_id} Closed -> Local Updated")
                         changes_count += 1
@@ -83,7 +105,10 @@ class SyncManager:
 
                     # Backfill ID if missing
                     if not issue_id:
-                        if not re.search(r'#\d+$', new_line.strip()):
+                        # Append ID if not present
+                        # Check if line already ends with ID pattern to be safe
+                        if not re.search(r'#\d+\s*$', new_line.strip()):
+                            # Preserve newline
                             new_line = new_line.rstrip() + f" #{remote_id}\n"
                             changes_count += 1
             

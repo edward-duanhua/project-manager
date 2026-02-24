@@ -9,26 +9,44 @@ class PhaseManager:
     """
     Manages project lifecycle phases, gate checks, and transitions.
     """
-    def __init__(self, connector, resource_mgr, repo_name):
+    def __init__(self, connector, resource_mgr, repo_name, config):
         self.connector = connector
         self.resource_mgr = resource_mgr
         self.repo = repo_name
+        self.config = config
         self.logger = logging.getLogger(__name__)
+
+    def _get_labels_for_phase(self, phase_key):
+        """
+        Retrieves labels for a given phase from config.
+        Maps short phase names (e.g., 'dev') to config keys (e.g., 'development').
+        """
+        sources = self.config.get("sources", {})
+        
+        # Mapping from CLI args to config keys
+        key_map = {
+            'requirement': 'requirements',
+            'design': 'design',
+            'dev': 'development',
+            'test': 'test' # Assuming 'test' might be added to config later
+        }
+        
+        config_key = key_map.get(phase_key, phase_key)
+        phase_config = sources.get(config_key, {})
+        
+        # Return configured labels or empty list if missing
+        return phase_config.get("labels", [])
 
     def check_gate(self, current_phase, next_phase):
         """Validates all conditions before phase transition. Returns closed tasks for next step."""
         self.logger.info(f"Checking gate conditions: {current_phase} -> {next_phase}")
         
-        label_map = {
-            'requirement': ['type:requirement'],
-            'design': ['type:design'],
-            'dev': ['type:dev']
-        }
+        required_labels = self._get_labels_for_phase(current_phase)
         
-        required_labels = label_map.get(current_phase)
         if not required_labels:
-            self.logger.warning(f"Unknown phase '{current_phase}'. Cannot gate check.")
-            return [] 
+            self.logger.warning(f"No labels configured for phase '{current_phase}'. Cannot perform strict gate check.")
+            # Depending on policy, we might allow pass or fail. Here we warn but return empty list (fail safe).
+            return []
 
         # 1. Fetch OPEN issues (must be empty for strict gate)
         open_issues = self.connector.fetch_issues(self.repo, state="open", labels=required_labels)

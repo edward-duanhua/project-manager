@@ -6,6 +6,10 @@ import argparse
 import sys
 import os
 import subprocess
+import dotenv
+
+# Load env
+dotenv.load_dotenv()
 
 # Add the parent directory of 'src' to sys.path so that 'src' can be imported
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -15,6 +19,7 @@ if parent_dir not in sys.path:
 
 # Import custom modules
 from src.connectors.github import GitHubConnector
+from src.connectors.gitcode import GitCodeConnector
 from src.core.resource import ResourceManager
 from src.core.phase import PhaseManager
 from src.core.sync import SyncManager
@@ -28,6 +33,16 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
+
+def load_config(path):
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load config: {e}")
+            return {}
+    return {}
 
 def main():
     parser = argparse.ArgumentParser(description="Project Control Center 2.0")
@@ -71,9 +86,46 @@ def main():
         return
 
     # Initialize Components
-    connector = GitHubConnector(logger=logger)
-    resource_mgr = ResourceManager(logger=logger)
+    config_path = os.path.join(parent_dir, "data", "config.json")
+    config = load_config(config_path)
+
+    provider = config.get("source_control", {}).get("provider", "github")
+    
+    if provider == "gitcode":
+        connector = GitCodeConnector(logger=logger)
+        logger.info("Using GitCode Connector")
+    else:
+        # Optimized: Read token env name from config
+        token_env = config.get("source_control", {}).get("github_token_env", "GITHUB_TOKEN")
+        connector = GitHubConnector(logger=logger, token_env=token_env)
+
+    # Use team_config from config
+    team_config_raw = config.get("team_config", "data/team.json")
+    
+    if team_config_raw.startswith("/"):
+        team_config_path = team_config_raw
+    else:
+        # If config is "skills/project-manager/data/team.json", we need to be careful
+        # parent_dir is /home/rancle/.openclaw/workspace/skills/project-manager
+        
+        # Check if it starts with the skill prefix
+        prefix = "skills/project-manager/"
+        if team_config_raw.startswith(prefix):
+             # Strip prefix to get relative path from skill root
+             clean_rel = team_config_raw[len(prefix):]
+             team_config_path = os.path.join(parent_dir, clean_rel)
+        else:
+             team_config_path = os.path.join(parent_dir, team_config_raw)
+
+    resource_mgr = ResourceManager(config_path=team_config_path, logger=logger)
     intelligence = IntelligenceEngine(logger=logger)
+
+    # Helper to get configured labels
+    def get_phase_labels(phase_name):
+        # Map phase name to config key
+        key_map = {'requirement': 'requirements', 'design': 'design', 'dev': 'development', 'test': 'test'}
+        key = key_map.get(phase_name, phase_name)
+        return config.get("sources", {}).get(key, {}).get("labels", [])
 
     # Dispatch Commands
     if args.command == "init":
@@ -81,24 +133,50 @@ def main():
         logger.info(f"Initializing project: {args.repo}...")
         try:
             # 1. Create Repo (if not exists)
-            # Check if repo exists first? Or just try create.
-            cmd = ["gh", "repo", "create", args.repo, "--private", "--add-readme"]
-            if args.desc:
-                cmd.extend(["--description", args.desc])
+            if provider == "gitcode":
+                # Use connector for GitCode
+                try:
+                    connector.create_repo(args.repo, description=args.desc)
+                    logger.info(f"Project initialized on GitCode: {args.repo}")
+                except Exception as e:
+                    logger.warning(f"Repo creation skipped/failed (might exist): {e}")
+            else:
+                # GitHub logic (subprocess GH)
+                cmd = ["gh", "repo", "create", args.repo, "--private", "--add-readme"]
+                if args.desc:
+                    cmd.extend(["--description", args.desc])
+                subprocess.run(cmd, check=False) # Don't fail if exists
+                logger.info(f"Project initialized on GitHub: {args.repo}")
             
-            subprocess.run(cmd, check=False) # Don't fail if exists
+            # 2. Create Labels from Config
+            sources = config.get("sources", {})
+            labels_to_create = []
             
-            # 2. Create Labels
-            labels = [
-                {"name": "type:requirement", "color": "0E8A16", "desc": "Project Requirement"},
-                {"name": "type:design", "color": "1D76DB", "desc": "Technical Design"},
-                {"name": "type:dev", "color": "F9D0C4", "desc": "Development Task"},
-                {"name": "type:test", "color": "C2E0C6", "desc": "Testing Task"}
-            ]
-            for label in labels:
-                subprocess.run(["gh", "label", "create", label["name"], "--repo", args.repo, "--color", label["color"], "--description", label["desc"]], check=False)
+            # Define default colors if not in config (config structure is simple list now)
+            # We will iterate through sources and add standard colors
+            colors = {
+                "requirements": "0E8A16", 
+                "design": "1D76DB", 
+                "development": "F9D0C4", 
+                "test": "C2E0C6"
+            }
+            
+            for key, data in sources.items():
+                phase_labels = data.get("labels", [])
+                for label_name in phase_labels:
+                    labels_to_create.append({
+                        "name": label_name, 
+                        "color": colors.get(key, "CCCCCC"),
+                        "desc": f"{key.title()} Phase Task"
+                    })
+
+            for label in labels_to_create:
+                if provider == "gitcode":
+                    connector.create_label(args.repo, label["name"], label["color"], description=label["desc"])
+                else:
+                    subprocess.run(["gh", "label", "create", label["name"], "--repo", args.repo, "--color", label["color"], "--description", label["desc"]], check=False)
                 
-            logger.info(f"Project initialized: https://github.com/{args.repo}")
+            logger.info("Project init complete.")
         except Exception as e:
             logger.error(f"Init failed: {e}")
 
@@ -118,11 +196,27 @@ def main():
                 task_title = task['title']
                 labels = ",".join(task['labels'])
                 
+                # Check for detailed body and other fields
+                body = task.get("body", "")
+                estimation = task.get("estimation", "")
+                
                 # Assignee prediction
                 assignees = resource_mgr.find_best_assignee(task['labels'])
                 assignee_str = f" @{assignees[0]}" if assignees else ""
                 
-                content += f"- [ ] {task_title} ({labels}){assignee_str}\n"
+                # Enhanced Markdown Format
+                content += f"## {task_title}\n"
+                content += f"- **Tags**: {labels}\n"
+                content += f"- **Assignee**: {assignee_str}\n"
+                if estimation:
+                    content += f"- **Estimation**: {estimation} SP\n"
+                
+                if body:
+                    content += f"\n{body}\n"
+                else:
+                    content += "- [ ] Implement task\n"
+                
+                content += "\n---\n"
                 
         # Add manual override section
         content += "\n## Manual Additions\n- [ ] \n"
@@ -139,12 +233,12 @@ def main():
             lines = f.readlines()
         
         import re
-        # Pattern: - [ ] Title (tags) @assignee #issue_id
-        # Group 1: [ x]
-        # Group 2: Title (including possible (tags))
-        # Group 3: @assignee (optional)
-        # Group 4: #issue_id (optional, ignore for import creation)
         pattern = re.compile(r'- \[([ x])\] (.*?)(?: @([\w-]+))?(?: #(\d+))?$')
+
+        # Get default requirement labels from config
+        req_labels = get_phase_labels('requirement')
+        if not req_labels:
+            req_labels = ["type:requirement"] # Fallback
 
         for line in lines:
             line_stripped = line.strip()
@@ -161,40 +255,32 @@ def main():
                     logger.info(f"Skipping existing issue #{existing_id}: {title_raw}")
                     continue
                 
-                # Assignee Logic: Manual Override > Auto Skill Match
+                # Assignee Logic
                 assignees = []
                 if manual_assignee:
                     assignees = [manual_assignee]
                 else:
-                    # Improved tag parsing from parens
-                    # Handle multiple groups: "Design UI (Mobile) (type:design)"
-                    import re
-                    tags = [title_raw] # Default fallback if no parens
-                    
-                    # Extract all (...) content
+                    # Parse tags from title like (type:dev, domain:api)
+                    tags = [title_raw] 
                     matches = re.findall(r'\(([^)]+)\)', title_raw)
                     if matches:
                         tags = []
                         for match in matches:
-                            # Split by comma for multiple tags in one paren: (type:dev, domain:api)
                             parts = [t.strip() for t in match.split(',')]
                             tags.extend(parts)
-                    
                     assignees = resource_mgr.find_best_assignee(tags)
                 
                 # Create Issue
                 logger.info(f"Creating: {title_raw}")
-                # Clean labels: if tags found, use them as GitHub labels too? Yes ideally.
-                # For now, stick to type:requirement as base
-                final_labels = ["type:requirement"]
-                
-                connector.create_issue(args.repo, title_raw, "Imported Task", labels=final_labels, assignees=assignees)
+                # Use configured labels
+                connector.create_issue(args.repo, title_raw, "Imported Task", labels=req_labels, assignees=assignees)
                 logger.info(f"Imported: {title_raw} -> Assigned to {assignees}")
 
     elif args.command == "launch":
-        phase_mgr = PhaseManager(connector, resource_mgr, args.repo)
+        # Pass config to PhaseManager
+        phase_mgr = PhaseManager(connector, resource_mgr, args.repo, config)
         
-        # 1. Check Gate: Returns list of CLOSED tasks from previous phase
+        # 1. Check Gate
         closed_parent_tasks = phase_mgr.check_gate(args.from_phase, args.to_phase)
         
         if not closed_parent_tasks:
@@ -203,14 +289,16 @@ def main():
 
         logger.info(f"Gate Passed. Found {len(closed_parent_tasks)} parent tasks.")
         
-        # 2. Generate Next Phase Tasks (Linked)
+        # 2. Generate Next Phase Tasks
+        next_phase_labels = get_phase_labels(args.to_phase)
+        
         next_tasks = []
         for parent in closed_parent_tasks:
             new_title = f"{args.to_phase.title()} for #{parent['number']}: {parent['title']}"
             new_task = {
                 "title": new_title,
                 "body": f"Transitioned from Phase: {args.from_phase}",
-                "labels": [f"type:{args.to_phase}"],
+                "labels": next_phase_labels,
                 "parent_id": parent['number']
             }
             next_tasks.append(new_task)
@@ -225,8 +313,17 @@ def main():
         sync_mgr.sync(args.file)
 
     elif args.command == "status":
-        report_gen = ReportGenerator(connector, resource_mgr, args.repo)
-        report_gen.generate(args.out)
+        report_gen = ReportGenerator(connector, resource_mgr, args.repo, config)
+        
+        # Determine output path: CLI args > Config > Default
+        out_path = args.out
+        if out_path == "REPORT.md": # Default value
+            export_dir = config.get("export", {}).get("path", ".")
+            if export_dir and export_dir != ".":
+                os.makedirs(export_dir, exist_ok=True)
+                out_path = os.path.join(export_dir, "REPORT.md")
+        
+        report_gen.generate(out_path)
 
 if __name__ == "__main__":
     main()

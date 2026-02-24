@@ -1,36 +1,28 @@
 {
+  "source_control": {
+    "provider": "gitcode",
+    "gitcode_token_env": "GITCODE_TOKEN",
+    "github_token_env": "GITHUB_TOKEN"
+  },
   "intelligence": {
     "mode": "llm",
     "provider": "google",
     "model": "gemini-3-pro-preview",
     "api_base": "https://generativelanguage.googleapis.com/v1beta/openai",
-    "api_key": "XXXXXX",
+    "api_key_env": "LLM_API_KEY",
     "temperature": 0.7
   },
   "team_config": "skills/project-manager/data/team.json",
   "sources": {
     "requirements": {
-      "type": "github",
       "labels": ["type:requirement"]
     },
     "design": {
-      "type": "github",
       "labels": ["type:design"]
     },
     "development": {
-      "type": "github",
       "labels": ["type:dev"]
     }
-  },
-  "status_mapping": {
-    "todo": ["status:todo", "triage"],
-    "in_progress": ["status:wip", "in-progress", "working"],
-    "review": ["status:review", "pr-open"],
-    "done": ["status:done", "closed"]
-  },
-  "thresholds": {
-    "overdue_grace_period_days": 0,
-    "max_active_tasks_per_person": 3
   },
   "export": {
     "path": "reports"
